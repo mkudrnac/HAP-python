@@ -4,8 +4,7 @@ import pickle
 import signal
 
 import pyhap.util as util
-from pyhap.accessories.TemperatureSensor import TemperatureSensor
-from pyhap.accessory import Bridge
+from pyhap.accessories.Fan import Fan
 from pyhap.accessory_driver import AccessoryDriver
 
 logging.basicConfig(level=logging.INFO)
@@ -26,7 +25,7 @@ def get_accessory():
     '''
     # Standalone accessory
     # Displayed name will be "test"
-    acc = TemperatureSensor.create("test", pincode=b"203-23-999")
+    acc = Fan.create("Fan", pincode=b"203-23-999")
     return acc
 
 
