@@ -1,71 +1,91 @@
 """This module implements the HAP Service."""
+from uuid import UUID
+
+from pyhap.const import HAP_REPR_CHARS, HAP_REPR_IID, HAP_REPR_TYPE
 
 
-class Service(object):
+class Service:
     """A representation of a HAP service.
 
-    A Service contains multiple characteristics. For example, a TemperatureSensor service
-    has the characteristic CurrentTemperature.
-
-    For the services that iOS natively supports, we distinguish two types of
-    characteristics - (1) "mandatory", which must be present when communciating with an
-    iOS client, and (2) optional, which may or may not be present. All mandatory and
-    optional characteristics for iOS-supported services are defined in the
-    resources/services.json file. When you load a service using the loader module, only
-    the mandatory characteristics are aded - you need to add any optional characteristics
-    yourself. This is because once a charateristic is present, iOS will want values for
-    it and we need to know how to set these.
+    A Service contains multiple characteristics. For example, a
+    TemperatureSensor service has the characteristic CurrentTemperature.
     """
-    def __init__(self, type_id, display_name=None, subtype=None):
+
+    __slots__ = ('broker', 'characteristics', 'display_name', 'type_id')
+
+    def __init__(self, type_id, display_name=None):
+        """Initialize a new Service object."""
+        self.broker = None
+        self.characteristics = []
         self.display_name = display_name
         self.type_id = type_id
-        self.subtype = subtype
-        self.characteristics = []
-        self.opt_characteristics = []
-        # TODO: name characteristic
 
-    def _add_chars(self, container, *chars):
-        """Helper method to add the given characteristics to the given container."""
-        for c in chars:
-            if not any(c.type_id == oc.type_id for oc in container):
-                container.append(c)
+    def __repr__(self):
+        """Return the representation of the service."""
+        return '<service display_name={} chars={}>' \
+            .format(self.display_name,
+                    {c.display_name: c.value for c in self.characteristics})
 
     def add_characteristic(self, *chars):
         """Add the given characteristics as "mandatory" for this Service."""
-        self._add_chars(self.characteristics, *chars)
+        for char in chars:
+            if not any(char.type_id == original_char.type_id
+                       for original_char in self.characteristics):
+                self.characteristics.append(char)
 
-    def add_opt_characteristic(self, *chars):
-        """Add the given characteristics as optional for this Service."""
-        self._add_chars(self.opt_characteristics, *chars)
-
-    def get_characteristic(self, name, check_optional=True):
+    def get_characteristic(self, name):
         """Return a Characteristic object by the given name from this Service.
 
-        Checks only the mandatory characteristics by default.
+        :param name: The name of the characteristic to search for.
+        :type name: str
 
-        @param name: The name of the characteristic to search for.
-        @type name: str
+        :raise ValueError if characteristic is not found.
 
-        @param check_optional: Whether to search in the optional characteristics as well.
-        @type check_optional: bool
-
-        @return: A characteristic with the given name or None if not found.
-        @rtype: Characteristic
+        :return: A characteristic with the given name.
+        :rtype: Characteristic
         """
-        char = next((c for c in self.characteristics if c.display_name == name),
-                    None)
-        if char is None and check_optional:
-            char = next((c for c in self.opt_characteristics if c.display_name == name),
-                        None)
-        assert char is not None
+        for char in self.characteristics:
+            if char.display_name == name:
+                return char
+        raise ValueError('Characteristic not found')
+
+    def configure_char(self, char_name, properties=None, valid_values=None,
+                       value=None, setter_callback=None, getter_callback=None):
+        """Helper method to return fully configured characteristic."""
+        char = self.get_characteristic(char_name)
+        if properties or valid_values:
+            char.override_properties(properties, valid_values)
+        if value:
+            char.set_value(value, should_notify=False)
+        if setter_callback:
+            char.setter_callback = setter_callback
+        if getter_callback:
+            char.getter_callback = getter_callback
         return char
 
-    def to_HAP(self, uuids):
-        characteristics = [c.to_HAP(uuids)
-                           for c in self.characteristics + self.opt_characteristics]
-        hap_rep = {
-            "iid": uuids[self.type_id],
-            "type": str(self.type_id).upper(),
-            "characteristics": characteristics,
+    # pylint: disable=invalid-name
+    def to_HAP(self):
+        """Create a HAP representation of this Service.
+
+        :return: A HAP representation.
+        :rtype: dict.
+        """
+        return {
+            HAP_REPR_IID: self.broker.iid_manager.get_iid(self),
+            HAP_REPR_TYPE: str(self.type_id).upper(),
+            HAP_REPR_CHARS: [c.to_HAP() for c in self.characteristics],
         }
-        return hap_rep
+
+    @classmethod
+    def from_dict(cls, name, json_dict, loader):
+        """Initialize a service object from a dict.
+
+        :param json_dict: Dictionary containing at least the keys `UUID` and
+            `RequiredCharacteristics`
+        :type json_dict: dict
+        """
+        type_id = UUID(json_dict.pop('UUID'))
+        service = cls(type_id, name)
+        for char_name in json_dict['RequiredCharacteristics']:
+            service.add_characteristic(loader.get_char(char_name))
+        return service

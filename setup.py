@@ -1,27 +1,26 @@
 from setuptools import setup
 
+import pyhap.const as pyhap_const
+
+
+PROJECT_NAME = 'HAP-python'
+URL = 'https://github.com/ikalchev/{}'.format(PROJECT_NAME)
+PROJECT_URLS = {
+    'Bug Reports': '{}/issues'.format(URL),
+    'Documentation': 'http://hap-python.readthedocs.io/en/latest/',
+    'Source': '{}/tree/master'.format(URL),
+}
+
+PYPI_URL = 'https://pypi.python.org/pypi/{}'.format(PROJECT_NAME)
+DOWNLOAD_URL = '{}/archive/{}.zip'.format(URL, pyhap_const.__version__)
+
+MIN_PY_VERSION = '.'.join(map(str, pyhap_const.REQUIRED_PYTHON_VER))
+
 setup(
-    name="HAP-python",
-    description="HomeKit Accessory Protocol implementation in python",
-    author="Ivan Kalchev",
-    version="0.5",
-    classifiers=[
-        'Development Status :: 4 - Beta',
-        'Programming Language :: Python :: 3'
-    ],
-    license="Apache-2.0",
-    packages=[
-        "pyhap",
-        "pyhap.accessories"
-    ],
-    install_requires=[
-        "pycryptodome",
-        "tlslite-ng",
-        "ed25519",
-        "zeroconf",
-        "curve25519-donna"
-    ],
-    package_data={
-        "pyhap": ["resources/*"],
-    }
+    name=PROJECT_NAME,
+    version=pyhap_const.__version__,
+    url=URL,
+    project_urls=PROJECT_URLS,
+    download_url=DOWNLOAD_URL,
+    python_requires='>={}'.format(MIN_PY_VERSION),
 )

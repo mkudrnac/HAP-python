@@ -1,11 +1,11 @@
-# This module implements the communication of HAP.
-#
-# The HAPServer is the point of contact to and from the world.
-# The HAPServerHandler manages the state of the connection and handles
-# incoming requests.
-# The HAPSocket is a socket implementation that manages the "TLS"
-# of the connection.
+"""This module implements the communication of HAP.
+
+The HAPServer is the point of contact to and from the world.
+The HAPServerHandler manages the state of the connection and handles incoming requests.
+The HAPSocket is a socket implementation that manages the "TLS" of the connection.
+"""
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from http import HTTPStatus
 import logging
 import socket
 import struct
@@ -14,6 +14,7 @@ import errno
 import uuid
 from urllib.parse import urlparse, parse_qs
 import socketserver
+import threading
 
 from tlslite.utils.chacha20_poly1305 import CHACHA20_POLY1305
 from Crypto.Protocol.KDF import HKDF
@@ -68,12 +69,12 @@ class HAP_CRYPTO:
 
 
 def _pad_tls_nonce(nonce, total_len=HAP_CRYPTO.TLS_NONCE_LEN):
-    """ Pads a nonce with zeroes so that total_len is reached. """
+    """Pads a nonce with zeroes so that total_len is reached."""
     return nonce.rjust(total_len, b"\x00")
 
 
 def hap_hkdf(key, salt, info):
-    """ Just a shorthand. """
+    """Just a shorthand."""
     return HKDF(key, HAP_CRYPTO.HKDF_KEYLEN, salt, HAP_CRYPTO.HKDF_HASH, context=info)
 
 
@@ -86,11 +87,11 @@ class NotAllowedInStateException(Exception):
 
 
 class HAPServerHandler(BaseHTTPRequestHandler):
-    """ Manages HAP connection state and handles incoming HTTP requests. """
+    """Manages HAP connection state and handles incoming HTTP requests."""
 
     # Mapping from paths to methods that handle them.
     HANDLERS = {
-        "POST":  {
+        "POST": {
             "/pair-setup": "handle_pairing",
             "/pair-verify": "handle_pair_verify",
             "/pairings": "handle_pairings",
@@ -132,7 +133,7 @@ class HAPServerHandler(BaseHTTPRequestHandler):
         @type accessory_handler: AccessoryDriver
         """
         self.accessory_handler = accessory_handler
-        self.accessory = self.accessory_handler.accessory
+        self.state = self.accessory_handler.state
         self.enc_context = None
         self.is_encrypted = False
         # Redirect separate handlers to the dispatch method
@@ -153,7 +154,7 @@ class HAPServerHandler(BaseHTTPRequestHandler):
         @param client_public: The client's session public key.
         @type client_public: bytes
 
-        @param private_key: The accessory's session private key.
+        @param private_key: The state's session private key.
         @type private_key: bytes
 
         @param shared_key: The resulted session key.
@@ -211,7 +212,7 @@ class HAPServerHandler(BaseHTTPRequestHandler):
 
     def handle_pairing(self):
         """Handles arbitrary step of the pairing process."""
-        if self.accessory.paired:
+        if self.state.paired:
             raise NotAllowedInStateException
 
         length = int(self.headers["Content-Length"])
@@ -342,11 +343,11 @@ class HAPServerHandler(BaseHTTPRequestHandler):
         output_key = hap_hkdf(long_to_bytes(session_key),
                               self.PAIRING_5_SALT, self.PAIRING_5_INFO)
 
-        server_public = self.accessory.public_key.to_bytes()
-        mac = self.accessory.mac.encode()
+        server_public = self.state.public_key.to_bytes()
+        mac = self.state.mac.encode()
 
         material = output_key + mac + server_public
-        private_key = self.accessory.private_key
+        private_key = self.state.private_key
         server_proof = private_key.sign(material)
 
         message = tlv.encode(HAP_TLV_TAGS.USERNAME, mac,
@@ -375,7 +376,7 @@ class HAPServerHandler(BaseHTTPRequestHandler):
 
         Pair verify is session negotiation.
         """
-        if not self.accessory.paired:
+        if not self.state.paired:
             raise NotAllowedInStateException
 
         length = int(self.headers["Content-Length"])
@@ -404,9 +405,9 @@ class HAPServerHandler(BaseHTTPRequestHandler):
             # Key is hashed before being returned, we don't want it; This fixes that.
             lambda x: x)
 
-        mac = self.accessory.mac.encode()
+        mac = self.state.mac.encode()
         material = public_key.serialize() + mac + client_public
-        server_proof = self.accessory.private_key.sign(material)
+        server_proof = self.state.private_key.sign(material)
 
         output_key = hap_hkdf(shared_key, self.PVERIFY_1_SALT, self.PVERIFY_1_INFO)
 
@@ -445,7 +446,7 @@ class HAPServerHandler(BaseHTTPRequestHandler):
             + self.enc_context["public_key"].serialize()
 
         client_uuid = uuid.UUID(str(client_username, "ascii"))
-        perm_client_public = self.accessory.paired_clients.get(client_uuid)
+        perm_client_public = self.state.paired_clients.get(client_uuid)
         if perm_client_public is None:
             logger.debug("Client %s attempted pair verify without being paired first.",
                          client_uuid)
@@ -483,6 +484,7 @@ class HAPServerHandler(BaseHTTPRequestHandler):
 
         hap_rep = self.accessory_handler.get_accessories()
         data = json.dumps(hap_rep).encode("utf-8")
+        logger.debug('Sending acc data: %s', data)
         self.send_response(200)
         self.send_header("Content-Type", self.JSON_RESPONSE_TYPE)
         self.end_response(data)
@@ -493,8 +495,7 @@ class HAPServerHandler(BaseHTTPRequestHandler):
             raise UnprivilegedRequestException
 
         # Check that char exists and ...
-        params = parse_qs(
-                    urlparse(self.path).query)
+        params = parse_qs(urlparse(self.path).query)
         chars = self.accessory_handler.get_characteristics(params["id"][0].split(","))
 
         data = json.dumps(chars).encode("utf-8")
@@ -505,21 +506,26 @@ class HAPServerHandler(BaseHTTPRequestHandler):
     def handle_set_characteristics(self):
         """Handles a client request to update certain characteristics."""
         if not self.is_encrypted:
-            raise UnprivilegedRequestException
+            logger.warning('Attemp to access unauthorised content from %s',
+                           self.client_address)
+            self.send_response(HTTPStatus.UNAUTHORIZED)
+            self.end_response(b'', close_connection=True)
 
-        # TODO: assert self.headers["authorization"] == accessory.pincode
-        data_len = int(self.headers["Content-Length"])
-        assert data_len > 0
+        data_len = int(self.headers['Content-Length'])
         requested_chars = json.loads(
-                              self.rfile.read(data_len).decode("utf-8"))
+            self.rfile.read(data_len).decode('utf-8'))
+        logger.debug('Set characteristics content: %s', requested_chars)
 
-        chars = self.accessory_handler.set_characteristics(requested_chars,
-                                                           self.client_address)
-
-        data = json.dumps(chars).encode("utf-8")
-        self.send_response(207)
-        self.send_header("Content-Type", self.JSON_RESPONSE_TYPE)
-        self.end_response(data)
+        # TODO: Outline how chars return errors on set_chars.
+        try:
+            self.accessory_handler.set_characteristics(requested_chars,
+                                                       self.client_address)
+        except Exception as e:
+            logger.exception('Exception in set_characteristics: %s', e)
+            self.send_response(HTTPStatus.BAD_REQUEST)
+        else:
+            self.send_response(HTTPStatus.NO_CONTENT)
+            self.end_response(b'')
 
     def handle_pairings(self):
         """Handles a client request to update or remove a pairing."""
@@ -543,7 +549,7 @@ class HAPServerHandler(BaseHTTPRequestHandler):
         client_public = tlv_objects[HAP_TLV_TAGS.PUBLIC_KEY]
         client_uuid = uuid.UUID(str(client_username, "utf-8"))
         should_confirm = self.accessory_handler.pair(
-                             client_uuid, client_public)
+            client_uuid, client_public)
         if not should_confirm:
             self.send_response(500)
             return
@@ -567,8 +573,12 @@ class HAPServerHandler(BaseHTTPRequestHandler):
 
 
 class HAPSocket(socket.socket):
-    """
-    A socket implementing the HAP crypto. Just feed it as if it is a normal socket.
+    """A socket implementing the HAP crypto. Just feed it as if it is a normal socket.
+
+    @note: HAP requires something like HTTP push. This implies we can have regular HTTP
+    response and an outbound HTTP push at the same time on the same socket - a race
+    condition. Thus, HAPSocket implements exclusive access to send and sendall to deal
+    with this situation.
     """
 
     MAX_BLOCK_LENGTH = 0x400
@@ -580,8 +590,7 @@ class HAPSocket(socket.socket):
 
     def __init__(self, sock, shared_key):
         """Initialises this socket from the given socket."""
-        socket.socket.__init__(self, sock.family, sock.type, sock.proto,
-                               sock.fileno())
+        socket.socket.__init__(self, sock.family, sock.type, sock.proto, sock.fileno())
         sock.detach()
         # See if we are connected
         try:
@@ -600,16 +609,19 @@ class HAPSocket(socket.socket):
         self.in_count = 0
         self.out_cipher = None
         self.in_cipher = None
+        self.out_lock = threading.RLock()  # for locking send operations
+        # NOTE: Some future python implementation of HTTP Server or Server Handler can use
+        # methods different than the ones we lock now (send, sendall).
+        # This will break the encryption/decryption before introducing a race condition,
+        # but don't forget locking these other methods after fixing the crypto.
 
-        self._makefile_refs = 0
         self._set_ciphers()
-
         self.curr_in_total = None  # Length of the current incoming block
         self.num_in_recv = None  # Number of bytes received from the incoming block
         self.curr_in_block = None  # Bytes of the current incoming block
 
     def _set_ciphers(self):
-
+        """Generate out/inbound encryption keys and initialise respective ciphers."""
         outgoing_key = hap_hkdf(self.shared_key, self.CIPHER_SALT, self.OUT_CIPHER_INFO)
         self.out_cipher = CHACHA20_POLY1305(outgoing_key, "python")
 
@@ -618,13 +630,26 @@ class HAPSocket(socket.socket):
 
     # socket.socket interface
 
+    def _with_out_lock(func):
+        """Return a function that acquires the outbound lock and executes func."""
+        def _wrapper(self, *args, **kwargs):
+            with self.out_lock:
+                return func(self, *args, **kwargs)
+        return _wrapper
+
     def recv_into(self, buffer, nbytes=1042, flags=0):
+        """Receive and decrypt up to nbytes in the given buffer."""
         data = self.recv(nbytes, flags)
         for i, b in enumerate(data):
             buffer[i] = b
         return len(data)
 
     def recv(self, buflen=1042, flags=0):
+        """Receive up to buflen bytes.
+
+        The received full cipher blocks are decrypted and returned and partial cipher
+        blocks are buffered locally.
+        """
         assert not flags and buflen > self.LENGTH_LENGTH
 
         result = b""
@@ -638,7 +663,7 @@ class HAPSocket(socket.socket):
                     # 1 byte left, return whatever we have.
                     return result
                 block_length_bytes = socket.socket.recv(self, self.LENGTH_LENGTH)
-                if len(block_length_bytes) == 0:
+                if not block_length_bytes:
                     return result
                 # TODO: handle this
                 assert len(block_length_bytes) == self.LENGTH_LENGTH
@@ -661,14 +686,12 @@ class HAPSocket(socket.socket):
                 self.num_in_recv += actual_len
                 if self.num_in_recv == self.curr_in_total:
                     # We read a whole block. Decrypt it and append it to the result.
-                    nonce = _pad_tls_nonce(
-                                 struct.pack("Q", self.in_count))
+                    nonce = _pad_tls_nonce(struct.pack("Q", self.in_count))
                     # Note we are removing the mac length from the total length
                     block_length = self.curr_in_total - self.in_cipher.tagLength
                     plaintext = self.in_cipher.open(
-                                    nonce,
-                                    bytearray(self.curr_in_block),
-                                    struct.pack("H", block_length))
+                        nonce, bytearray(self.curr_in_block),
+                        struct.pack("H", block_length))
                     result += plaintext
                     self.in_count += 1
                     self.curr_in_block = None
@@ -676,13 +699,17 @@ class HAPSocket(socket.socket):
 
         return result
 
+    @_with_out_lock
     def send(self, data, flags=0):
+        """Encrypt and send the given data."""
         # TODO: the two methods need to be handled differently, but...
         # The reason for the below hack is that SocketIO calls this method instead of
         # sendall.
         return self.sendall(data, flags)
 
+    @_with_out_lock
     def sendall(self, data, flags=0):
+        """Encrypt and send the given data."""
         assert not flags
         result = b""
         offset = 0
@@ -690,10 +717,8 @@ class HAPSocket(socket.socket):
         while offset < total:
             length = min(total - offset, self.MAX_BLOCK_LENGTH)
             length_bytes = struct.pack("H", length)
-            block = bytearray(
-                         data[offset: offset + length])
-            nonce = _pad_tls_nonce(
-                       struct.pack("Q", self.out_count))
+            block = bytearray(data[offset: offset + length])
+            nonce = _pad_tls_nonce(struct.pack("Q", self.out_count))
             ciphertext = length_bytes \
                 + self.out_cipher.seal(nonce, block, length_bytes)
             offset += length
@@ -705,10 +730,25 @@ class HAPSocket(socket.socket):
 
 class HAPServer(socketserver.ThreadingMixIn,
                 HTTPServer):
+    """Point of contact for HAP clients.
+
+    The HAPServer handles all incoming client requests (e.g. pair) and also handles
+    communication from Accessories to clients (value changes). The outbound communication
+    is something like HTTP push.
+
+    @note: Client requests responses as well as outgoing event notifications happen through
+    the same socket for the same client. This introduces a race condition - an Accessory
+    decides to push a change in current temperature, while in the same time the HAP client
+    decides to query the state of the Accessory. To overcome this the HAPSocket class
+    implements exclusive access to the send methods.
+    """
 
     EVENT_MSG_STUB = b"EVENT/1.0 200 OK\r\n" \
                      b"Content-Type: application/hap+json\r\n" \
                      b"Content-Length: "
+
+    TIMEOUT_ERRNO_CODES = (errno.ECONNRESET, errno.EPIPE, errno.EHOSTUNREACH,
+                           errno.ETIMEDOUT)
 
     @classmethod
     def create_hap_event(cls, bytesdata):
@@ -730,6 +770,31 @@ class HAPServer(socketserver.ThreadingMixIn,
         self.connections = {}  # (address, port): socket
         self.accessory_handler = accessory_handler
 
+    def _close_socket(self, sock):
+        """Shutdown and close the given socket."""
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except socket.error:
+            pass
+        sock.close()
+
+    def _handle_sock_timeout(self, client_addr, exception):
+        """Handle a socket timeout.
+
+        Closes the socket for ``client_addr``.
+
+        :raise exception: if it is not a timeout.
+        """
+        # NOTE: In python <3.3 socket.timeout is not OSError, hence the above.
+        # Also, when it is actually an OSError, it MAY not have an errno equal to
+        # ETIMEDOUT.
+        sock = self.connections.pop(client_addr, None)
+        if sock is not None:
+            self._close_socket(sock)
+        if not isinstance(exception, socket.timeout) \
+                and exception.errno not in self.TIMEOUT_ERRNO_CODES:
+            raise exception
+
     def get_request(self):
         """Calls the super's method, caches the connection and returns."""
         client_socket, client_addr = super(HAPServer, self).get_request()
@@ -740,43 +805,41 @@ class HAPServer(socketserver.ThreadingMixIn,
     def finish_request(self, sock, client_addr):
         try:
             self.RequestHandlerClass(sock, client_addr, self, self.accessory_handler)
-        except OSError as e:
-            self.connections.pop(client_addr, None)
-            if e.errno not in (errno.ECONNRESET, errno.EHOSTUNREACH):
-                raise e
-            logger.debug("Connection reset")
+        except (OSError, socket.timeout) as e:
+            self._handle_sock_timeout(client_addr, e)
+            logger.debug("Connection timeout")
 
     def server_close(self):
         """Close all connections."""
         logger.info("Stopping HAP server")
         super(HAPServer, self).server_close()
         for sock in self.connections.values():
-            try:
-                sock.shutdown(socket.SHUT_RDWR)
-            except socket.error:
-                pass
-            sock.close()
+            self._close_socket(sock)
         self.connections.clear()
 
     def push_event(self, bytesdata, client_addr):
-        """Sends an event to the current connection with the provided data.
+        """Send an event to the current connection with the provided data.
 
-        @param data: The data to send.
-        @type data: bytes
+        .. note: Sets a timeout of PUSH_EVENT_TIMEOUT for the duration of socket.sendall.
 
-        @return: True if sending was successful, False otherwise.
-        @rtype: bool
+        :param bytesdata: The data to send.
+        :type bytesdata: bytes
+
+        :param client_addr: A client (address, port) tuple to which to send the data.
+        :type client_addr: tuple <str, int>
+
+        :return: True if sending was successful, False otherwise.
+        :rtype: bool
         """
+        client_socket = self.connections.get(client_addr)
+        if client_socket is None:
+            return False
+        data = self.create_hap_event(bytesdata)
         try:
-            client_socket = self.connections.get(client_addr)
-            if client_socket is not None:
-                client_socket.sendall(
-                    self.create_hap_event(bytesdata))
-            return client_socket is not None
-        except OSError as e:
-            self.connections.pop(client_addr, None)
-            if e.errno not in (errno.EPIPE, errno.EHOSTUNREACH):
-                raise e
+            client_socket.sendall(data)
+            return True
+        except (OSError, socket.timeout) as e:
+            self._handle_sock_timeout(client_addr, e)
             return False
 
     def upgrade_to_encrypted(self, client_address, shared_key):

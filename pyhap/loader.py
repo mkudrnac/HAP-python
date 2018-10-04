@@ -1,79 +1,99 @@
-# Various classes that construct representations of
-# HAP services and characteristics from a json
-# representation.
-#
-# The idea is, give a name of a service and you get an
-# instance of it (as long as it is described in some
-# json file).
-import uuid
+"""
+Various classes that construct representations of
+HAP services and characteristics from a json
+representation.
+
+The idea is, give a name of a service and you get an
+instance of it (as long as it is described in some
+json file).
+"""
 import json
+import logging
 
 from pyhap import CHARACTERISTICS_FILE, SERVICES_FILE
 from pyhap.characteristic import Characteristic
 from pyhap.service import Service
 
-# Because we are loading mostly from the characteristics.json
-# and services.json files, these loaders are "cached".
-_char_loader = None
-_serv_loader = None
+_loader = None
+logger = logging.getLogger(__name__)
 
 
-class TypeLoader(object):
+class Loader:
+    """Looks up type descriptions based on a name.
 
-    def __init__(self, fp):
-        self.types = json.load(fp)
+    .. seealso:: pyhap/resources/services.json
+    .. seealso:: pyhap/resources/characteristics.json
+    """
 
-    def get(self, name):
-        return self.types[name].copy()
+    def __init__(self, path_char=CHARACTERISTICS_FILE,
+                 path_service=SERVICES_FILE):
+        """Initialize a new Loader instance."""
+        self.char_types = self._read_file(path_char)
+        self.serv_types = self._read_file(path_service)
 
+    @staticmethod
+    def _read_file(path):
+        """Read file and return a dict."""
+        with open(path, 'r') as file:
+            return json.load(file)
 
-class CharLoader(TypeLoader):
+    def get_char(self, name):
+        """Return new Characteristic object."""
+        char_dict = self.char_types[name].copy()
+        if 'Format' not in char_dict or \
+            'Permissions' not in char_dict or \
+                'UUID' not in char_dict:
+            raise KeyError('Could not load char {}!'.format(name))
+        return Characteristic.from_dict(name, char_dict)
 
-    def get(self, name, char_class=Characteristic):
-        char_info = super(CharLoader, self).get(name)
-        type_id = uuid.UUID(char_info["type_id"])
-        props = char_info
-        props.pop("type_id")
+    def get_service(self, name):
+        """Return new service object."""
+        service_dict = self.serv_types[name].copy()
+        if 'RequiredCharacteristics' not in service_dict or \
+                'UUID' not in service_dict:
+            raise KeyError('Could not load service {}!'.format(name))
+        return Service.from_dict(name, service_dict, self)
 
-        return char_class(name, type_id, props)
-
-
-class ServiceLoader(TypeLoader):
-
-    def __init__(self, desc_file, char_loader=None):
-        super(ServiceLoader, self).__init__(desc_file)
-        self.char_loader = char_loader or get_char_loader()
-
-    def get(self, name):
-        serv_info = super(ServiceLoader, self).get(name)
-        type_id = uuid.UUID(serv_info["type_id"])
-        s = Service(type_id, name)
-        chars = [self.char_loader.get(c) for c in serv_info["characteristics"]]
-        s.add_characteristic(*chars)
-        return s
-
-
-def get_char_loader(desc_file=CHARACTERISTICS_FILE):
-    global _char_loader
-    if desc_file == CHARACTERISTICS_FILE:
-        if _char_loader is None:
-            with open(desc_file, "r") as fp:
-                _char_loader = CharLoader(fp)
-        return _char_loader
-
-    with open(desc_file, "r") as fp:
-        ld = CharLoader(fp)
-    return ld
+    @classmethod
+    def from_dict(cls, char_dict=None, serv_dict=None):
+        """Create a new instance directly from json dicts."""
+        loader = cls.__new__(Loader)
+        loader.char_types = char_dict or {}
+        loader.serv_types = serv_dict or {}
+        return loader
 
 
-def get_serv_loader(desc_file=SERVICES_FILE):
-    global _serv_loader
-    if desc_file == SERVICES_FILE:
-        if _serv_loader is None:
-            with open(desc_file, "r") as fp:
-                _serv_loader = ServiceLoader(fp)
-        return _serv_loader
+def get_loader():
+    """Get a service and char loader.
 
-    with open(desc_file, "r") as fp:
-        ld = ServiceLoader(fp)
-    return ld
+    If already initialized it returns the existing one.
+    """
+    # pylint: disable=global-statement
+    global _loader
+    if _loader is None:
+        _loader = Loader()
+    return _loader
+
+
+# pylint: disable=unused-argument
+def get_char_loader(desc_file=None):
+    """Get a CharacteristicLoader with characteristic descriptions in the given file.
+
+    .. deprecated:: 2.0
+       Use `get_loader` instead.
+    """
+    logger.warning(
+        "'get_char_loader' is deprecated. Use 'get_loader' instead.")
+    return get_loader()
+
+
+# pylint: disable=unused-argument
+def get_serv_loader(desc_file=None):
+    """Get a ServiceLoader with service descriptions in the given file.
+
+    .. deprecated:: 2.0
+       Use `get_loader` instead.
+    """
+    logger.warning(
+        "'get_serv_loader' is deprecated. Use 'get_loader' instead.")
+    return get_loader()
