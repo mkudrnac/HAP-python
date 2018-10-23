@@ -151,12 +151,12 @@ class AccessoryDriver:
         else:
             self.loop = loop or asyncio.new_event_loop()
 
-        executer_opts = {'max_workers': None}
+        executor_opts = {'max_workers': None}
         if sys.version_info >= (3, 6):
-            executer_opts['thread_name_prefix'] = 'SyncWorker'
+            executor_opts['thread_name_prefix'] = 'SyncWorker'
 
-        self.executer = ThreadPoolExecutor(**executer_opts)
-        self.loop.set_default_executor(self.executer)
+        self.executor = ThreadPoolExecutor(**executor_opts)
+        self.loop.set_default_executor(self.executor)
 
         self.accessory = None
         self.http_server_thread = None
@@ -252,8 +252,8 @@ class AccessoryDriver:
     async def async_stop(self):
         """Stops the AccessoryDriver and shutdown all remaining tasks."""
         await self.async_add_job(self._do_stop)
-        logger.debug('Shutdown executers')
-        self.executer.shutdown()
+        logger.debug('Shutdown executors')
+        self.executor.shutdown()
         self.loop.stop()
 
     def _do_stop(self):
@@ -286,7 +286,7 @@ class AccessoryDriver:
         logger.debug("AccessoryDriver stopped successfully")
 
     def add_job(self, target, *args):
-        """Add job to executer pool."""
+        """Add job to executor pool."""
         if target is None:
             raise ValueError("Don't call add_job with None.")
         self.loop.call_soon_threadsafe(self.async_add_job, target, *args)
@@ -519,6 +519,7 @@ class AccessoryDriver:
         hap_rep = self.accessory.to_HAP()
         if not isinstance(hap_rep, list):
             hap_rep = [hap_rep, ]
+        logger.debug('Get accessories response:\n%s', json.dumps(hap_rep, indent=3))
         return {HAP_REPR_ACCS: hap_rep}
 
     def get_characteristics(self, char_ids):
@@ -554,6 +555,7 @@ class AccessoryDriver:
                 rep[HAP_REPR_STATUS] = SERVICE_COMMUNICATION_FAILURE
 
             chars.append(rep)
+        logger.debug("Get chars response: %s", json.dumps(chars, indent=3))
         return {HAP_REPR_CHARS: chars}
 
     def set_characteristics(self, chars_query, client_addr):
@@ -581,6 +583,8 @@ class AccessoryDriver:
 
             if HAP_PERMISSION_NOTIFY in cq:
                 char_topic = get_topic(aid, iid)
+                logger.debug('Subscribed client %s to topic %s',
+                             client_addr, char_topic)
                 self.subscribe_client_topic(
                     client_addr, char_topic, cq[HAP_PERMISSION_NOTIFY])
 
