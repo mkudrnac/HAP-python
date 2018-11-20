@@ -16,14 +16,49 @@ Sections
 ### Developers
 -->
 
-## [2.2.3] - 2018-10-05
+## [2.4.1] - 2018-11-11
+
+### Fixed
+- Correctly proxy `_io_refs` to the socket. [#145](https://github.com/ikalchev/HAP-python/issues/145)
+
+
+## [2.4.0] - 2018-11-10
 
 ### Added
+- Added a `asyncio.SafeChildWatcher` as part of `AccessoryDriver.start` if started in the main thread.
+- Added `Camera.stop`, which terminates all streaming processes.
+- `AccessoryDriver.safe_mode` parameter. Set with `driver.safe_mode = True` before `driver.start` to disable `update_advertisement` call for `pair` and `unpair`. After unpairing a restart is necessary. [#168](https://github.com/ikalchev/HAP-python/pull/168)
+
+### Changed
+- The default implementations of the `Camera`'s `start_stream`, `stop_stream` and
+`reconfigure_stream` are now async.
+- The streaming process is started with `asyncio.create_subprocess_exec` instead of
+`subprocess.Popen`
+- Moved most of the metadata from `setup.py` to `setup.cfg`. Added long description.
+
+### Fixed
+- `AccessoryDriver.add_job` now correctly schedules coroutines wrapped in functools.partial.
+- Fixed the slow shutdown in python 3.7, which was caused by the changed
+behavior of `ThreadingMixIn.server_close`.
+- Fixed an issue where sockets are blocked on `recv` while in `CLOSE_WAIT` state, which
+can eventually exhausts the limit of open sockets. [#145](https://github.com/ikalchev/HAP-python/issues/145)
+
+### Reverted
+- `Char.client_update_value` no longer ignores duplicate values. Reverts [#162](https://github.com/ikalchev/HAP-python/pull/162). [#166](https://github.com/ikalchev/HAP-python/pull/166)
+
+
+## [2.3.0] - 2018-10-25
+
+### Added
+- Added support for the camera accessory. [#161](https://github.com/ikalchev/HAP-python/pull/161)
+- Added a demo script that starts four fake accessories.
 - Added `NeoPixelsLightStrip` accessory. [#144](https://github.com/ikalchev/HAP-python/pull/144)
 - Added new Accessory categories. [Commit](https://github.com/ikalchev/HAP-python/commit/dbf1d5d8fea814af52098f3a2f3cd5a47cd889c1)
 
 ### Changed
+- Updated the README with information on how to setup a camera accessory.
 - Spelling fix - executor (accessory_driver). [#159](https://github.com/ikalchev/HAP-python/pull/159)
+- Char.client_update_value now ignores call if value is already set. This could happen during automations. [#162](https://github.com/ikalchev/HAP-python/pull/162)
 
 ### Fixed
 - Updated README. [#138](https://github.com/ikalchev/HAP-python/pull/138)

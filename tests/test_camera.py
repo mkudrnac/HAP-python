@@ -1,5 +1,5 @@
 """Tests for pyhap.camera."""
-from unittest.mock import patch
+from unittest.mock import patch, Mock
 from uuid import UUID
 
 from pyhap import camera
@@ -69,7 +69,7 @@ def test_setup_endpoints(mock_driver):
 
     set_endpoint_res = ('ARCszGzBBWNFFY2pdLRQkAaRAgEAAxoBAQACDTE5Mi4xNjguMS4yMjYDAjPFBAK'
                         's1gQlAQEAAhDYlmCkyTBZQfxqFS3OnxVOAw4bQZm5NuoQjyanlqWA0QUlAQEAAh'
-                        'AKRPSRVaqGeNmESTIojxNiAw78WkjTLtGv0waWnLo9gQYEAAAAAQcEAAAAAQ==')
+                        'AKRPSRVaqGeNmESTIojxNiAw78WkjTLtGv0waWnLo9gQYBAQcBAQ==')
 
     acc = camera.Camera(_OPTIONS, mock_driver, 'Camera')
     setup_endpoints = acc.get_service('CameraRTPStreamManagement')\
@@ -81,6 +81,22 @@ def test_setup_endpoints(mock_driver):
 
 def test_set_selected_stream_start_stop(mock_driver):
     """Test starting a stream request"""
+    # mocks for asyncio.Process
+    async def communicate():
+        return (None, "stderr")
+
+    async def wait():
+        pass
+
+    process_mock = Mock()
+
+    # Mock for asyncio.create_subprocess_exec
+    async def subprocess_exec(*args, **kwargs):
+        process_mock.id = 42
+        process_mock.communicate = communicate
+        process_mock.wait = wait
+        return process_mock
+
     selected_config_req = ('ARUCAQEBEKzMbMEFY0UVjal0tFCQBpECNAEBAAIJAQEAAgEAAwEAAwsBAoAC'
                            'AgJoAQMBHgQXAQFjAgQr66FSAwKEAAQEAAAAPwUCYgUDLAEBAgIMAQEBAgEA'
                            'AwEBBAEeAxYBAW4CBMUInmQDAhgABAQAAKBABgENBAEA')
@@ -91,29 +107,28 @@ def test_set_selected_stream_start_stop(mock_driver):
         'id': session_id,
         'address': '192.168.1.114',
         'v_port': 50483,
-        'v_srtp_params': '2JZgpMkwWUH8ahUtzp8VThtBmbk26hCPJqeWpYDR',
+        'v_srtp_key': '2JZgpMkwWUH8ahUtzp8VThtBmbk26hCPJqeWpYDR',
         'a_port': 54956,
-        'a_srtp_params': 'CkT0kVWqhnjZhEkyKI8TYvxaSNMu0a/TBpacuj2B',
+        'a_srtp_key': 'CkT0kVWqhnjZhEkyKI8TYvxaSNMu0a/TBpacuj2B',
         'process': None
     }
 
     acc = camera.Camera(_OPTIONS, mock_driver, 'Camera')
+
     acc.sessions[session_id] = session_info
 
-    selected_config = acc.get_service('CameraRTPStreamManagement')\
-                         .get_characteristic('SelectedRTPStreamConfiguration')
+    patcher = patch('asyncio.create_subprocess_exec', new=subprocess_exec)
+    patcher.start()
 
-    patcher = patch('subprocess.Popen', spec=True)
-    patched_popen = patcher.start()
-    patched_popen.return_value.pid = 42
-    selected_config.client_update_value(selected_config_req)
-    patcher.stop()
+    acc.set_selected_stream_configuration(selected_config_req)
 
     assert acc.streaming_status == camera.STREAMING_STATUS['STREAMING']
 
     selected_config_stop_req = 'ARUCAQABEKzMbMEFY0UVjal0tFCQBpE='
-    selected_config.client_update_value(selected_config_stop_req)
+    acc.set_selected_stream_configuration(selected_config_stop_req)
+
+    patcher.stop()
 
     assert session_id not in acc.sessions
-    assert patched_popen.return_value.kill.called
+    assert process_mock.terminate.called
     assert acc.streaming_status == camera.STREAMING_STATUS['AVAILABLE']

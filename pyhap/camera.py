@@ -16,11 +16,12 @@ streaming.
 [5. At some point the client can reconfigure or stop the stream similarly to step 3.]
 """
 
+import asyncio
+import functools
 import os
 import ipaddress
 import logging
 import struct
-import subprocess
 from uuid import UUID
 
 from pyhap import RESOURCE_DIR
@@ -202,13 +203,8 @@ AUDIO_CODEC_PARAM_SAMPLE_RATE_TYPES = {
 SUPPORTED_AUDIO_CODECS_TAG = b'\x01'
 SUPPORTED_COMFORT_NOISE_TAG = b'\x02'
 SUPPORTED_AUDIO_CONFIG_TAG = b'\x02'
-
 SET_CONFIG_REQUEST_TAG = b'\x02'
-
 SESSION_ID = b'\x01'
-
-
-# Non-HAP constants
 
 
 NO_SRTP = b'\x01\x01\x02\x02\x00\x03\x00'
@@ -217,26 +213,15 @@ NO_SRTP = b'\x01\x01\x02\x02\x00\x03\x00'
 
 FFMPEG_CMD = (
     # pylint: disable=bad-continuation
-    'ffmpeg -re -f avfoundation -r 29.970000 -i 0:0 -threads 0 '
-    '-pix_fmt uyvy422 -vcodec libx264 -an -r {v_fps} -f rawvideo -tune zerolatency '
-    '-vf scale={v_width}:{v_height} -b:v {v_bitrate}k -bufsize {v_bitrate}k -g 300 '
+    'ffmpeg -re -f avfoundation -i 0:0 -threads 0 '
+    '-vcodec libx264 -an -pix_fmt yuv420p -r {fps} -f rawvideo -tune zerolatency '
+    '-vf scale={width}:{height} -b:v {v_max_bitrate}k -bufsize {v_max_bitrate}k '
     '-payload_type 99 -ssrc {v_ssrc} -f rtp '
-    '-srtp_out_suite AES_CM_128_HMAC_SHA1_80 -srtp_out_params {v_srtp_params} '
-    'srtp://{address}:{v_port}?rtcpport={v_port}'
-    '&localrtcpport={v_port}&pkt_size=1378'
+    '-srtp_out_suite AES_CM_128_HMAC_SHA1_80 -srtp_out_params {v_srtp_key} '
+    'srtp://{address}:{v_port}?rtcpport={v_port}&'
+    'localrtcpport={v_port}&pkt_size=1378'
 )
 '''Template for the ffmpeg command.'''
-
-FFMPEG_AUDIO_CMD = (
-    # pylint: disable=bad-continuation
-    '-map 0:1 -acodec libmp3lame '
-    '-profile:a aac_eld -flags +global_header -f null -ar {a_sample_rate}k '
-    '-b:a {a_bitrate}k -bufsize {a_bitrate}k -ac 1 -payload_type 110 '
-    '-ssrc {a_ssrc} -f rtp -srtp_out_suite AES_CM_128_HMAC_SHA1_80 '
-    '-srtp_out_params {a_srtp_params} '
-    'srtp://{address}:{a_port}?rtcpport={a_port}'
-    '&localrtcpport={a_port}&pkt_size=1316'
-)
 
 
 class Camera(Accessory):
@@ -256,7 +241,6 @@ class Camera(Accessory):
         :type support_srtp: bool
         """
         if support_srtp:
-            # XXX: Add support for other suites
             crypto = SRTP_CRYPTO_SUITES['AES_CM_128_HMAC_SHA1_80']
         else:
             crypto = SRTP_CRYPTO_SUITES['NONE']
@@ -420,14 +404,7 @@ class Camera(Accessory):
             - start_stream_cmd - string specifying the command to be executed to start
                 the stream. The string can contain the keywords, corresponding to the
                 video and audio configuration that was negotiated between the camera
-                and the client. The keywords will be substituted before the command
-                is ran:
-                - fps - Frames per second
-                - width, height
-                - bitrate
-                - ssrc - synchronisation source
-                - video_srtp_key - Video cipher key
-                - target_address - The address to which the camera should stream
+                and the client. See the ``start`` method for a full list of parameters.
 
         :type options: ``dict``
         """
@@ -448,7 +425,7 @@ class Camera(Accessory):
         self.add_preload_service('Microphone')
         management = self.add_preload_service('CameraRTPStreamManagement')
         management.configure_char('StreamingStatus',
-                                  getter_callback=self.get_streaimg_status)
+                                  getter_callback=self._get_streaimg_status)
         management.configure_char('SupportedRTPConfiguration',
                                   value=self.get_supported_rtp_config(
                                                 options.get('srtp', False)))
@@ -463,8 +440,10 @@ class Camera(Accessory):
         management.configure_char('SetupEndpoints',
                                   setter_callback=self.set_endpoints)
 
-    def _start_stream(self, objs, reconfigure):  # pylint: disable=unused-argument
+    async def _start_stream(self, objs, reconfigure):  # pylint: disable=unused-argument
         """Start or reconfigure video streaming for the given session.
+
+        Schedules ``self.start_stream`` or ``self.reconfigure``.
 
         No support for reconfigure currently.
 
@@ -494,28 +473,27 @@ class Camera(Accessory):
             video_attrs = video_objs.get(VIDEO_TYPES['ATTRIBUTES'])
             if video_attrs:
                 video_attr_objs = tlv.decode(video_attrs)
-
-                opts['v_width'] = struct.unpack('<H',
+                opts['width'] = struct.unpack('<H',
                             video_attr_objs[VIDEO_ATTRIBUTES_TYPES['IMAGE_WIDTH']])[0]
-                opts['v_height'] = struct.unpack('<H',
+                opts['height'] = struct.unpack('<H',
                             video_attr_objs[VIDEO_ATTRIBUTES_TYPES['IMAGE_HEIGHT']])[0]
-                opts['v_fps'] = struct.unpack('<B',
+                opts['fps'] = struct.unpack('<B',
                                 video_attr_objs[VIDEO_ATTRIBUTES_TYPES['FRAME_RATE']])[0]
 
             video_rtp_param = video_objs.get(VIDEO_TYPES['RTP_PARAM'])
             if video_rtp_param:
                 video_rtp_param_objs = tlv.decode(video_rtp_param)
+                # TODO: Optionals, handle the case where they are missing
                 opts['v_ssrc'] = 1 or struct.unpack('<I',
                     video_rtp_param_objs.get(
                         RTP_PARAM_TYPES['SYNCHRONIZATION_SOURCE']))[0]
                 opts['v_payload_type'] = \
                     video_rtp_param_objs.get(RTP_PARAM_TYPES['PAYLOAD_TYPE'])
-                opts['v_bitrate'] = struct.unpack('<H',
+                opts['v_max_bitrate'] = struct.unpack('<H',
                     video_rtp_param_objs.get(RTP_PARAM_TYPES['MAX_BIT_RATE']))[0]
-                opts['v_rtcp_interval'] = \
-                    video_rtp_param_objs.get(RTP_PARAM_TYPES['RTCP_SEND_INTERVAL'])
-                opts['v_max_mtu'] = \
-                    video_rtp_param_objs.get(RTP_PARAM_TYPES['MAX_MTU'])
+                opts['v_rtcp_interval'] = struct.unpack('<f',
+                    video_rtp_param_objs.get(RTP_PARAM_TYPES['RTCP_SEND_INTERVAL']))[0]
+                opts['v_max_mtu'] = video_rtp_param_objs.get(RTP_PARAM_TYPES['MAX_MTU'])
 
         if audio_tlv:
             audio_objs = tlv.decode(audio_tlv)
@@ -526,40 +504,32 @@ class Camera(Accessory):
                                         audio_objs[AUDIO_TYPES['RTP_PARAM']])
             opts['a_comfort_noise'] = audio_objs[AUDIO_TYPES['COMFORT_NOISE']]
 
-            # XXX: handle audio codec
             opts['a_channel'] = \
-                audio_codec_param_objs[AUDIO_CODEC_PARAM_TYPES['CHANNEL']]
-            opts['a_bitrate'] = \
-                audio_codec_param_objs[AUDIO_CODEC_PARAM_TYPES['BIT_RATE']]
-            opts['a_sample_rate'] = \
-                audio_codec_param_objs[AUDIO_CODEC_PARAM_TYPES['SAMPLE_RATE']]
-            opts['a_packet_time'] = \
-                audio_codec_param_objs[AUDIO_CODEC_PARAM_TYPES['PACKET_TIME']]
+                audio_codec_param_objs[AUDIO_CODEC_PARAM_TYPES['CHANNEL']][0]
+            opts['a_bitrate'] = struct.unpack('?',
+                audio_codec_param_objs[AUDIO_CODEC_PARAM_TYPES['BIT_RATE']])[0]
+            opts['a_sample_rate'] = 8 * (
+                1 + audio_codec_param_objs[AUDIO_CODEC_PARAM_TYPES['SAMPLE_RATE']][0])
+            opts['a_packet_time'] = struct.unpack('<B',
+                audio_codec_param_objs[AUDIO_CODEC_PARAM_TYPES['PACKET_TIME']])[0]
 
-            opts['a_ssrc'] = 1 or \
-                audio_rtp_param_objs[RTP_PARAM_TYPES['SYNCHRONIZATION_SOURCE']]
-            opts['a_payload_type'] = \
-                audio_rtp_param_objs[RTP_PARAM_TYPES['PAYLOAD_TYPE']]
-            opts['a_bitrate'] = audio_rtp_param_objs[RTP_PARAM_TYPES['MAX_BIT_RATE']]
-            opts['a_rtcp_interval'] = \
-                audio_rtp_param_objs[RTP_PARAM_TYPES['RTCP_SEND_INTERVAL']]
+            opts['a_ssrc'] = struct.unpack('<I',
+                audio_rtp_param_objs[RTP_PARAM_TYPES['SYNCHRONIZATION_SOURCE']])[0]
+            opts['a_payload_type'] = audio_rtp_param_objs[RTP_PARAM_TYPES['PAYLOAD_TYPE']]
+            opts['a_max_bitrate'] = struct.unpack('<H',
+                audio_rtp_param_objs[RTP_PARAM_TYPES['MAX_BIT_RATE']])[0]
+            opts['a_rtcp_interval'] = struct.unpack('<f',
+                audio_rtp_param_objs[RTP_PARAM_TYPES['RTCP_SEND_INTERVAL']])[0]
             opts['a_comfort_payload_type'] = \
                 audio_rtp_param_objs[RTP_PARAM_TYPES['COMFORT_NOISE_PAYLOAD_TYPE']]
-
-        opts.setdefault('v_width', 1280)
-        opts.setdefault('v_height', 720)
-        opts.setdefault('v_bitrate', 300)
-        opts.setdefault('v_fps', 30)
 
         session_objs = tlv.decode(objs[SELECTED_STREAM_CONFIGURATION_TYPES['SESSION']])
         session_id = UUID(bytes=session_objs[SETUP_TYPES['SESSION_ID']])
         session_info = self.sessions[session_id]
 
         opts.update(session_info)
-        opts.pop('process', None)
-
-        success = self.reconfigure_stream(session_info, opts) if reconfigure \
-            else self.start_stream(session_info, opts)
+        success = await self.reconfigure_stream(session_info, opts) if reconfigure \
+            else await self.start_stream(session_info, opts)
 
         if success:
             self.streaming_status = STREAMING_STATUS['STREAMING']
@@ -569,21 +539,24 @@ class Camera(Accessory):
             del self.sessions[session_id]
             self.streaming_status = STREAMING_STATUS['AVAILABLE']
 
-    def get_streaimg_status(self):
+    def _get_streaimg_status(self):
         """Get the streaming status in TLV format.
 
         Called when iOS reads the StreaminStatus ``Characteristic``.
         """
         return tlv.encode(b'\x01', self.streaming_status, to_base64=True)
 
-    def _stop_stream(self, objs):
+    async def _stop_stream(self, objs):
         """Stop the stream for the specified session.
+
+        Schedules ``self.stop_stream``.
 
         :param objs: TLV-decoded SelectedRTPStreamConfiguration value.
         :param objs: ``dict``
         """
         session_objs = tlv.decode(objs[SELECTED_STREAM_CONFIGURATION_TYPES['SESSION']])
         session_id = UUID(bytes=session_objs[SETUP_TYPES['SESSION_ID']])
+
         session_info = self.sessions.get(session_id)
 
         if not session_info:
@@ -591,7 +564,7 @@ class Camera(Accessory):
                           'such session was found', session_id)
             return
 
-        self.stop_stream(session_info)
+        await self.stop_stream(session_info)
         del self.sessions[session_id]
 
         self.streaming_status = STREAMING_STATUS['AVAILABLE']
@@ -601,25 +574,34 @@ class Camera(Accessory):
 
         Called from iOS to set the SelectedRTPStreamConfiguration ``Characteristic``.
 
+        This method schedules a stream for the session in ``value`` to be start, stopped
+        or reconfigured, depending on the request.
+
         :param value: base64-encoded selected configuration in TLV format
         :type value: ``str``
         """
+        logging.debug('set_selected_stream_config - value - %s', value)
+
         objs = tlv.decode(value, from_base64=True)
         if SELECTED_STREAM_CONFIGURATION_TYPES['SESSION'] not in objs:
-            raise ValueError('Session ID not found in selected stream configuration.')
+            logging.error('Bad request to set selected stream configuration.')
+            return
 
-        session_info = tlv.decode(objs[SELECTED_STREAM_CONFIGURATION_TYPES['SESSION']])
+        session = tlv.decode(objs[SELECTED_STREAM_CONFIGURATION_TYPES['SESSION']])
 
-        request_type = session_info[SET_CONFIG_REQUEST_TAG][0]
+        request_type = session[b'\x02'][0]
         logging.debug('Set stream config request: %d', request_type)
         if request_type == 1:
-            self._start_stream(objs, reconfigure=False)
+            job = functools.partial(self._start_stream, reconfigure=False)
         elif request_type == 0:
-            self._stop_stream(objs)
+            job = self._stop_stream
         elif request_type == 4:
-            self._start_stream(objs, reconfigure=True)
+            job = functools.partial(self._start_stream, reconfigure=True)
         else:
             logging.error('Unknown request type %d', request_type)
+            return
+
+        self.driver.add_job(job, objs)
 
     def set_endpoints(self, value):
         """Configure streaming endpoints.
@@ -636,12 +618,13 @@ class Camera(Accessory):
         # Extract address info
         address_tlv = objs[SETUP_TYPES['ADDRESS']]
         address_info_objs = tlv.decode(address_tlv)
-        is_ipv6 = address_info_objs[SETUP_ADDR_INFO['ADDRESS_VER']]
-        address = address_info_objs[SETUP_ADDR_INFO['ADDRESS']].decode('utf-8')
-        target_video_port = \
-            struct.unpack('<H', address_info_objs[SETUP_ADDR_INFO['VIDEO_RTP_PORT']])[0]
-        target_audio_port = \
-            struct.unpack('<H', address_info_objs[SETUP_ADDR_INFO['AUDIO_RTP_PORT']])[0]
+        is_ipv6 = struct.unpack('?',
+            address_info_objs[SETUP_ADDR_INFO['ADDRESS_VER']])[0]
+        address = address_info_objs[SETUP_ADDR_INFO['ADDRESS']].decode('utf8')
+        target_video_port = struct.unpack(
+            '<H', address_info_objs[SETUP_ADDR_INFO['VIDEO_RTP_PORT']])[0]
+        target_audio_port = struct.unpack(
+            '<H', address_info_objs[SETUP_ADDR_INFO['AUDIO_RTP_PORT']])[0]
 
         # Video SRTP Params
         video_srtp_tlv = objs[SETUP_TYPES['VIDEO_SRTP_PARAM']]
@@ -684,12 +667,12 @@ class Camera(Accessory):
             video_srtp_tlv = NO_SRTP
             audio_srtp_tlv = NO_SRTP
 
-        # XXX use urandom, but fit it in the allowed range
-        video_ssrc = b'\x00\x00\x00\x01'
-        audio_ssrc = b'\x00\x00\x00\x01'
+        # TODO: Use os.urandom(4) but within the allowed value bounds
+        video_ssrc = b'\x01'
+        audio_ssrc = b'\x01'
 
         res_address_tlv = tlv.encode(
-            SETUP_ADDR_INFO['ADDRESS_VER'], is_ipv6,
+            SETUP_ADDR_INFO['ADDRESS_VER'], self.stream_address_isv6,
             SETUP_ADDR_INFO['ADDRESS'], self.stream_address.encode('utf-8'),
             SETUP_ADDR_INFO['VIDEO_RTP_PORT'], struct.pack('<H', target_video_port),
             SETUP_ADDR_INFO['AUDIO_RTP_PORT'], struct.pack('<H', target_audio_port))
@@ -708,23 +691,25 @@ class Camera(Accessory):
             'id': session_id,
             'address': address,
             'v_port': target_video_port,
-            'v_srtp_params': to_base64_str(video_master_key + video_master_salt),
-            # XXX: these are sent when SetSelectedConfiguration is set,
-            # do we need to keep them here?
-            # 'v_ssrc': video_ssrc,
+            'v_srtp_key': to_base64_str(video_master_key + video_master_salt),
+            # TODO: 'v_ssrc': video_ssrc,
             'a_port': target_audio_port,
-            'a_srtp_params': to_base64_str(audio_master_key + audio_master_salt),
-            # 'a_ssrc': audio_ssrc,
-            'process': None
+            'audio_srtp_key': to_base64_str(audio_master_key + audio_master_salt),
+            'a_ssrc': audio_ssrc
         }
 
         self.get_service('CameraRTPStreamManagement')\
             .get_characteristic('SetupEndpoints')\
             .set_value(response_tlv)
 
+    async def stop(self):
+        """Stop all streaming sessions."""
+        await asyncio.gather(*(
+            self.stop_stream(session_info) for session_info in self.sessions.values()))
+
     # ### For client extensions ###
 
-    def start_stream(self, session_info, stream_config):
+    async def start_stream(self, session_info, stream_config):
         """Start a new stream with the given configuration.
 
         This method can be implemented to start a new stream. Any specific information
@@ -739,33 +724,31 @@ class Camera(Accessory):
             for session storage. Available keys:
             - id - The session ID.
         :type session_info: ``dict``
-
         :param stream_config: Stream configuration, as negotiated with the HAP client.
             Implementations can only use part of these. Available keys:
-
             General configuration:
                 - address - The IP address from which the camera will stream
                 - v_port - Remote port to which to stream video
-                - v_srtp_params - Base64-encoded key and salt value for the
+                - v_srtp_key - Base64-encoded key and salt value for the
                     AES_CM_128_HMAC_SHA1_80 cipher to use when streaming video.
                     The key and the salt are concatenated before encoding
                 - a_port - Remote audio port to which to stream audio
-                - a_srtp_params - As v_srtp_params, but for the audio stream.
-
+                - a_srtp_key - As v_srtp_params, but for the audio stream.
             Video configuration:
-                - v_profile_id - The profile ID for the H.264 codec, e.g. baseline
-                - v_level - The level in the profile ID, e.g. 3:1
-                - v_width - Video width
-                - v_height - Video height
-                - v_fps - Video frame rate
+                - v_profile_id - The profile ID for the H.264 codec, e.g. baseline.
+                    Refer to ``VIDEO_CODEC_PARAM_PROFILE_ID_TYPES``.
+                - v_level - The level in the profile ID, e.g. 3:1.
+                    Refer to ``VIDEO_CODEC_PARAM_LEVEL_TYPES``.
+                - width - Video width
+                - height - Video height
+                - fps - Video frame rate
                 - v_ssrc - Video synchronisation source
                 - v_payload_type - Type of the video codec
-                - v_bitrate - Maximum bit rate generated by the codec in kbps
+                - v_max_bitrate - Maximum bit rate generated by the codec in kbps
                     and averaged over 1 second
                 - v_rtcp_interval - Minimum RTCP interval in seconds
                 - v_max_mtu - MTU that the IP camera must use to transmit
                     Video RTP packets.
-
             Audio configuration:
                 - a_bitrate - Whether the bitrate is variable or constant
                 - a_codec - Audio codec
@@ -789,23 +772,27 @@ class Camera(Accessory):
         cmd = self.start_stream_cmd.format(**stream_config).split()
         logging.debug('Executing start stream command: "%s"', ' '.join(cmd))
         try:
-            process = subprocess.Popen(cmd)
+            process = await asyncio.create_subprocess_exec(*cmd,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.PIPE,
+                    limit=1024)
         except Exception as e:  # pylint: disable=broad-except
             logging.error('Failed to start streaming process because of error: %s', e)
             return False
 
         session_info['process'] = process
 
-        logging.info('Started stream process - PID %d', process.pid)
+        logging.info('[%s] Started stream process - PID %d',
+                     session_info['id'], process.pid)
 
         return True
 
-    def stop_stream(self, session_info):
+    async def stop_stream(self, session_info):  # pylint: disable=no-self-use
         """Stop the stream for the given ``session_id``.
 
         This method can be implemented if custom stop stream commands are needed. The
         default implementation gets the ``process`` value from the ``session_info``
-        object and kills it (assumes it is a ``subprocess.Popen`` object).
+        object and terminates it (assumes it is a ``subprocess.Popen`` object).
 
         :param session_info: The session info object. Available keys:
             - id - The session ID.
@@ -815,11 +802,21 @@ class Camera(Accessory):
         ffmpeg_process = session_info.get('process')
         if ffmpeg_process:
             logging.info('[%s] Stopping stream.', session_id)
-            ffmpeg_process.kill()
+            try:
+                ffmpeg_process.terminate()
+                _, stderr = await asyncio.wait_for(
+                    ffmpeg_process.communicate(), timeout=2.0)
+                logging.debug('Stream command stderr: %s', stderr)
+            except asyncio.TimeoutError:
+                logging.error('Timeout while waiting for the stream process '
+                              'to terminate. Trying with kill.')
+                ffmpeg_process.kill()
+                await ffmpeg_process.wait()
+            logging.debug('Stream process stopped.')
         else:
             logging.warning('No process for session ID %s', session_id)
 
-    def reconfigure_stream(self, session_info, stream_config):
+    async def reconfigure_stream(self, session_info, stream_config):
         """Reconfigure the stream so that it uses the given ``stream_config``.
 
         :param session_info: The session object for the session that needs to
@@ -830,7 +827,7 @@ class Camera(Accessory):
         :return: True if and only if the reconfiguration is successful.
         :rtype: ``bool``
         """
-        return self.start_stream(session_info, stream_config)
+        await self.start_stream(session_info, stream_config)
 
     def get_snapshot(self, image_size):  # pylint: disable=unused-argument, no-self-use
         """Return a jpeg of a snapshot from the camera.
